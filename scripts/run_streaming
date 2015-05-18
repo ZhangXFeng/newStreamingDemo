@@ -1,0 +1,298 @@
+#!/bin/bash
+
+SCALA_VERSION=2.10
+
+# Figure out where the Scala framework is installed
+FWDIR="/usr/lib/ngmr"
+USER=`whoami`
+
+# Export this as SPARK_HOME
+if [ "$SPARK_HOME" == "" ]; then 
+  export SPARK_HOME="$FWDIR"
+fi
+
+# Load environment variables from conf/spark-env.sh, if it exists
+if [ -e $FWDIR/conf/spark-env.sh ] ; then
+  . $FWDIR/conf/spark-env.sh
+fi
+
+SCALA_HOME=/usr/lib/scala
+
+if [ "$SPARK_LAUNCH_WITH_SCALA" == "1" ]; then
+  if [ "$SCALA_HOME" ]; then
+    RUNNER="${SCALA_HOME}/bin/scala"
+  else
+    if [ `command -v scala` ]; then
+      RUNNER="scala"
+    else
+      echo "SCALA_HOME is not set and scala is not in PATH" >&2
+      exit 1
+    fi
+  fi
+else
+  if [ `command -v /usr/java/latest/bin/java` ]; then 
+    RUNNER="/usr/java/latest/bin/java"
+  else 
+    if [ `command -v $JAVA_HOME/bin/java` ]; then
+      RUNNER="$JAVA_HOME/bin/java"
+    else
+      if [ `command -v java` ]; then
+        RUNNER="java"
+      else
+        echo "Can't find java command"
+        exit 1
+      fi 
+    fi
+  fi
+  if [ -z "$SCALA_LIBRARY_PATH" ]; then
+    if [ -z "$SCALA_HOME" ]; then
+      echo "SCALA_HOME is not set" >&2
+      exit 1
+    fi
+    SCALA_LIBRARY_PATH="$SCALA_HOME/lib"
+  fi
+fi
+
+source bin/ngmr-context-env.sh
+# Figure out how much memory to use per executor and set it as an environment
+# variable so that our process sees it and can report it to Mesos
+if [ -z "$SPARK_MEM" ] ; then
+  SPARK_MEM="$NGMR_COMMON_MEMORY"G
+fi
+export SPARK_MEM=16G
+
+mem_num=$SPARK_MEM
+mem_num=${mem_num%m}
+mem_num=${mem_num%M}
+mem_num=${mem_num%G}
+mem_num=${mem_num%g}
+
+# Set JAVA_OPTS to be able to load native libraries and to set heap size
+JAVA_OPTS+=" -Djava.library.path=$SPARK_LIBRARY_PATH "
+JAVA_OPTS+=" -Xms$SPARK_MEM -Xmx$SPARK_MEM "
+#JAVA_OPTS+=" -server -XX:+UseParNewGC -XX:NewRatio=2 "
+JAVA_OPTS+=" -server -XX:+UseParNewGC -XX:NewRatio=4 -XX:+CMSClassUnloadingEnabled "
+JAVA_OPTS+=" -XX:MinHeapFreeRatio=100 -XX:MaxHeapFreeRatio=100 -XX:CMSMaxAbortablePrecleanTime=1000 -XX:+ExplicitGCInvokesConcurrent "
+#-XX:+ExplicitGCInvokesConcurrent 
+JAVA_OPTS+=" -XX:MaxTenuringThreshold=4 -XX:TargetSurvivorRatio=8  "
+JAVA_OPTS+=" -XX:+HeapDumpOnOutOfMemoryError -XX:+UseConcMarkSweepGC -XX:CMSInitiatingOccupancyFraction=70 "
+#-XX:NewSize=$[mem_num/2]M "
+echo $JAVA_OPTS
+# Load extra JAVA_OPTS from conf/java-opts, if it exists
+if [ -e $FWDIR/conf/java-opts ] ; then
+  JAVA_OPTS="$JAVA_OPTS `cat $FWDIR/conf/java-opts`"
+fi
+export JAVA_OPTS
+
+CORE_DIR="$FWDIR/core"
+REPL_DIR="$FWDIR/repl"
+REPL_BIN_DIR="$FWDIR/repl-bin"
+EXAMPLES_DIR="$FWDIR/examples"
+BAGEL_DIR="$FWDIR/bagel"
+STREAMING_DIR="$FWDIR/streaming"
+YARN_DIR="$FWDIR/yarn/stable"
+PYSPARK_DIR="$FWDIR/python"
+EXTERNAL_DIR="$FWDIR/external"
+
+# Exit if the user hasn't compiled Spark
+if [ ! -e "$CORE_DIR/target" ]; then
+  echo "Failed to find Spark classes in $CORE_DIR/target" >&2
+  echo "You need to compile Spark before running this program" >&2
+  exit 1
+fi
+
+if [[ "$@" = *repl* && ! -e "$REPL_DIR/target" ]]; then
+  echo "Failed to find Spark classes in $REPL_DIR/target" >&2
+  echo "You need to compile Spark repl module before running this program" >&2
+  exit 1
+fi
+
+# Build up classpath
+CLASSPATH="$SPARK_CLASSPATH"
+
+if [ "$NGMR_CONF_CLASSPATH" == "" ]; then 
+  CLASSPATH+=":/etc/hadoop/conf:/etc/hbase/conf:$FWDIR/conf"
+else
+  CLASSPATH+=":$NGMR_CONF_CLASSPATH:$FWDIR/conf"
+fi
+
+CLASSPATH+=":$STREAMING_DIR/lib/org/apache/kafka/kafka/0.7.2-spark/*" # <-- our in-project Kafka Jar
+for C in `find  $CORE_DIR $REPL_DIR $BAGEL_DIR $STREAMING_DIR $EXAMPLES_DIR $YARN_DIR $EXTERNAL_DIR -name "ngmr*.jar"`
+do
+  CLASSPATH+=":$C"
+done
+
+CLASSPATH="$CLASSPATH:$STREAMING_DIR/lib/org/apache/kafka/kafka/0.7.2-spark/*" # <-- our in-project Kafka Jar
+if [ -e "$FWDIR/lib_managed" ]; then
+  for C in `find $FWDIR/lib_managed/jars -name "*.jar"`
+  do
+    CLASSPATH+=":$C"
+  done 
+  for C in `find $FWDIR/lib_managed/bundles -name "*.jar"`
+  do
+    if [ "$C" != *netty* ]; then
+      CLASSPATH+=":$C"
+    fi
+  done 
+fi
+CLASSPATH="$CLASSPATH:$REPL_DIR/lib/*"
+if [ -e $REPL_BIN_DIR/target ]; then
+  for jar in `find "$REPL_BIN_DIR/target" -name 'spark-repl-*-shaded-hadoop*.jar'`; do
+    CLASSPATH="$CLASSPATH:$jar"
+  done
+fi
+CLASSPATH+=":$BAGEL_DIR/target/scala-$SCALA_VERSION/classes"
+#for jar in `find $PYSPARK_DIR/lib -name '*jar'`; do
+#  CLASSPATH+=":$jar"
+#done
+export CLASSPATH # Needed for spark-shell
+
+# Figure out the JAR file that our examples were packaged into. This includes a bit of a hack
+# to avoid the -sources and -doc packages that are built by publish-local.
+if [ -e "$EXAMPLES_DIR/target/scala-$SCALA_VERSION/spark-examples"*[0-9T].jar ]; then
+  # Use the JAR from the SBT build
+  export SPARK_EXAMPLES_JAR=`ls "$EXAMPLES_DIR/target/scala-$SCALA_VERSION/spark-examples"*[0-9T].jar`
+fi
+if [ -e "$EXAMPLES_DIR/target/spark-examples-"*hadoop[12].jar ]; then
+  # Use the JAR from the Maven build
+  export SPARK_EXAMPLES_JAR=`ls "$EXAMPLES_DIR/target/spark-examples-"*hadoop[12].jar`
+fi
+
+# Add hadoop conf dir - else FileSystem.*, etc fail !
+# Note, this assumes that there is either a HADOOP_CONF_DIR or YARN_CONF_DIR which hosts
+# the configurtion files.
+if [ "x" != "x$HADOOP_CONF_DIR" ]; then
+  CLASSPATH="$CLASSPATH:$HADOOP_CONF_DIR"
+fi
+if [ "x" != "x$YARN_CONF_DIR" ]; then
+  CLASSPATH="$CLASSPATH:$YARN_CONF_DIR"
+fi
+
+CLASSPATH="$CLASSPATH:/usr/lib/ngmr/holodesk/target/scala-2.10/ngmr-holodesk_2.10-1.1.0-transwarp.jar:/usr/lib/ngmr/external/kafka/target/scala-2.10/ngmr-streaming-kafka_2.10-1.1.0-transwarp.jar"
+# Figure out whether to run our class with java or with the scala launcher.
+# In most cases, we'd prefer to execute our process with java because scala
+# creates a shell script as the parent of its Java process, which makes it
+# hard to kill the child with stuff like Process.destroy(). However, for
+# the Spark shell, the wrapper is necessary to properly reset the terminal
+# when we exit, so we allow it to set a variable to launch with scala.
+if [ "$SPARK_LAUNCH_WITH_SCALA" == "1" ]; then
+  EXTRA_ARGS=""     # Java options will be passed to scala as JAVA_OPTS
+else
+  CLASSPATH="$CLASSPATH:$SCALA_LIBRARY_PATH/scala-library.jar"
+  CLASSPATH="$CLASSPATH:$SCALA_LIBRARY_PATH/scala-compiler.jar"
+  CLASSPATH="$CLASSPATH:$SCALA_LIBRARY_PATH/jline.jar"
+  # The JVM doesn't read JAVA_OPTS by default so we need to pass it in
+  EXTRA_ARGS="$JAVA_OPTS"
+fi
+
+if [ "$SPARK_LOGFILE" != "" ]; then
+  EXTRA_ARGS+=" -Dngmr.logfile=$SPARK_LOGFILE "
+fi
+
+# Add Hadoop jars.
+for jar in `find /usr/lib/hadoop-mapreduce /usr/lib/hadoop-yarn /usr/lib/hadoop /usr/lib/hadoop-hdfs -name '*jar'`; do
+  # Ignore the logging library since it has already been included with the Spark jar.
+  if [[ "$jar" != *slf4j* && "$jar" != *netty* ]]; then
+    SPARK_CLASSPATH+=:$jar
+  fi
+done
+
+# Add Shark jars.
+for jar in `find $SHARK_HOME/lib -name '*jar'`; do
+  if [[ "$jar" != *slf4j* ]]; then
+    SPARK_CLASSPATH+=:$jar
+  fi
+done
+for jar in `find $SHARK_HOME/lib_managed/jars -name '*jar'`; do
+  if [[ "$jar" != *slf4j* && "$jar" != "*protobuf-java*" ]]; then
+    SPARK_CLASSPATH+=:$jar
+  fi
+done
+for jar in `find $SHARK_HOME/lib_managed/bundles -name '*jar'`; do
+  if [[ "$jar" != *slf4j* ]]; then
+    SPARK_CLASSPATH+=:$jar
+  fi
+done
+for jar in `find /usr/lib/hbase -name '*jar'`; do
+  if [[ "$jar" != *slf4j* && "$jar" != "*protobuf-java*" ]]; then
+    SPARK_CLASSPATH+=:$jar
+  fi
+done
+
+# Add Hive jars.
+for jar in `find $HIVE_HOME/lib -name '*jar'`; do
+  # Ignore the logging library since it has already been included with the Spark jar.
+  if [[ "$jar" != *slf4j* && "$jar" != "*protobuf-java*" ]]; then
+    SPARK_CLASSPATH+=:$jar
+  fi
+done
+
+SPARK_CLASSPATH+=:$HIVE_CONF_DIR
+
+# Build up classpath
+for jar in `find $SHARK_HOME/target/scala-$SCALA_VERSION -name 'ngmr-shell*jar'`; do 
+  SPARK_CLASSPATH+=":$jar"
+done
+
+export SPARK_CLASSPATH
+#echo $SPARK_CLASSPATH
+export CLASSPATH+=$SPARK_CLASSPATH
+
+CLASSPATH+=:./spark-examples_2.10-0.9.0-incubating-SNAPSHOT.jar:./stream.jar
+echo $CLASSPATH > /tmp/classpath
+
+# Add app jars.
+APP_JARS=""
+for jar in `find ./lib -name '*jar'`; do
+  # Ignore the logging library since it has already been included with the Spark jar.
+#  if [[ "$jar" != *slf4j* && "$jar" != "*protobuf-java*" ]]; then
+    APP_JARS+=:$jar
+#  fi
+done
+
+
+
+
+
+
+APP_JARS+=:./newStreamingDemo.jar
+#APP_JARS+=:examples/target/scala-2.10/spark-examples-assembly-0.9.0-incubating-SNAPSHOT.jar
+CLASSPATH+=":$APP_JARS"
+
+CLASSPATH+=:/root/newStreamingDemo/conf
+
+
+for jar in `find ./hadoopLib -name '*jar'`; do
+  # Ignore the logging library since it has already been included with the Spark jar.
+#  if [[ "$jar" != *slf4j* && "$jar" != "*protobuf-java*" ]]; then
+    CLASSPATH+=:$jar
+#  fi
+done
+for jar in `find ./hbaseLib -name '*jar'`; do
+  # Ignore the logging library since it has already been included with the Spark jar.
+#  if [[ "$jar" != *slf4j* && "$jar" != "*protobuf-java*" ]]; then
+    CLASSPATH+=:$jar
+#  fi
+done
+for jar in `find ./ngmr_lib -name '*jar'`; do
+  # Ignore the logging library since it has already been included with the Spark jar.
+#  if [[ "$jar" != *slf4j* && "$jar" != "*protobuf-java*" ]]; then
+    CLASSPATH+=:$jar
+#  fi
+done
+for jar in `find ./scala_lib -name '*jar'`; do
+  # Ignore the logging library since it has already been included with the Spark jar.
+#  if [[ "$jar" != *slf4j* && "$jar" != "*protobuf-java*" ]]; then
+    CLASSPATH+=:$jar
+#  fi
+done
+
+
+
+export SPARK_JAR=`find $SPARK_HOME/core/target -name "ngmr*jar"`
+#export SPARK_YARN_APP_JAR=$APP_JARS
+export SPARK_YARN_APP_JAR=./newStreamingDemo.jar
+#export SPARK_YARN_APP_JAR=examples/target/scala-2.10/spark-examples-assembly-0.9.0-incubating-SNAPSHOT.jar
+
+"$RUNNER" -cp "$CLASSPATH" $EXTRA_ARGS -Dspark.streaming.unpersist=true -Dspark.ui.port=4040 "$@"
+
